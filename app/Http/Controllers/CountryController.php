@@ -16,8 +16,9 @@ class CountryController extends Controller
     public function refresh()
     {
         try {
-            // ✅ Correct REST Countries v3.1 API
-            $countriesResponse = Http::timeout(30)->get('https://restcountries.com/v2/all?fields=name,capital,region,population,flag,currencies');
+            $countriesResponse = Http::timeout(30)->get('https://restcountries.com/v2/all', [
+                'fields' => 'name,capital,region,population,flag,currencies'
+            ]);
 
             if ($countriesResponse->failed()) {
                 return response()->json([
@@ -28,9 +29,7 @@ class CountryController extends Controller
 
             $countries = $countriesResponse->json();
 
-            // ✅ Exchange Rates
             $exchangeResponse = Http::timeout(30)->get('https://open.er-api.com/v6/latest/USD');
-
             if ($exchangeResponse->failed()) {
                 return response()->json([
                     'error' => 'External data source unavailable',
@@ -44,47 +43,45 @@ class CountryController extends Controller
             $savedCount = 0;
 
             foreach ($countries as $countryData) {
+                $name = $countryData['name'] ?? null;
+                $population = $countryData['population'] ?? null;
+                if (!$name || !$population) continue;
 
-    $name = $countryData['name'] ?? null;
-    $capital = $countryData['capital'] ?? null;
-    $region = $countryData['region'] ?? null;
-    $population = $countryData['population'] ?? null;
-    $flagUrl = $countryData['flag'] ?? null;
+                $currency = $countryData['currencies'][0] ?? null;
+                $currencyCode = $currency['code'] ?? null;
 
-    if (!$name || !$population) continue;
+                $exchangeRate = null;
+                $estimatedGdp = null;
 
-    $currencyCode = null;
-    if (!empty($countryData['currencies']) && isset($countryData['currencies'][0]['code'])) {
-        $currencyCode = $countryData['currencies'][0]['code'];
-    }
+                if ($currencyCode && isset($rates[$currencyCode]) && $rates[$currencyCode] != 0) {
+                    $exchangeRate = $rates[$currencyCode];
+                    $multiplier = rand(1000, 2000);
+                    $estimatedGdp = ($population * $multiplier) / $exchangeRate;
+                }
 
-    $exchangeRate = $currencyCode && isset($rates[$currencyCode])
-        ? $rates[$currencyCode]
-        : null;
+                Country::updateOrCreate(
+                    ['name' => $name],
+                    [
+                        'capital' => $countryData['capital'] ?? null,
+                        'region' => $countryData['region'] ?? null,
+                        'population' => $population,
+                        'currency_code' => $currencyCode,
+                        'exchange_rate' => $exchangeRate,
+                        'estimated_gdp' => $estimatedGdp,
+                        'flag_url' => $countryData['flag'] ?? null,
+                        'last_refreshed_at' => $now,
+                    ]
+                );
 
-    $estimatedGdp = $exchangeRate
-        ? ($population * rand(1000, 2000)) / $exchangeRate
-        : null;
+                $savedCount++;
+            }
 
-    Country::updateOrCreate(
-        ['name' => $name],
-        [
-            'capital' => $capital,
-            'region' => $region,
-            'population' => $population,
-            'currency_code' => $currencyCode,
-            'exchange_rate' => $exchangeRate,
-            'estimated_gdp' => $estimatedGdp,
-            'flag_url' => $flagUrl,
-            'last_refreshed_at' => $now,
-        ]
-    );
-
-    $savedCount++;
-}
-
-            // ✅ Generate summary image
-            $this->generateSummaryImage();
+            // Wrap image generation in try-catch so it won't break the request
+            try {
+                $this->generateSummaryImage();
+            } catch (\Throwable $e) {
+                Log::warning('Summary image generation failed: ' . $e->getMessage());
+            }
 
             return response()->json([
                 'message' => 'Countries refreshed successfully',
@@ -92,7 +89,7 @@ class CountryController extends Controller
                 'last_refreshed_at' => $now->toIso8601String()
             ], 200);
 
-        } catch (\Exception $e) {
+        } catch (\Throwable $e) {
             Log::error('Refresh failed: ' . $e->getMessage());
             return response()->json(['error' => 'Internal server error'], 500);
         }
@@ -116,7 +113,6 @@ class CountryController extends Controller
 
         return response()->json($query->get());
     }
-
     public function show($name)
     {
         $country = Country::where('name', 'LIKE', "%{$name}%")->first();
@@ -143,9 +139,13 @@ class CountryController extends Controller
 
     public function status()
     {
+        $total = Country::count();
+        $last = Country::max('last_refreshed_at');
+        $formatted = $last ? Carbon::parse($last)->toIso8601String() : null;
+
         return response()->json([
-            'total_countries' => Country::count(),
-            'last_refreshed_at' => Country::max('last_refreshed_at'),
+            'total_countries' => $total,
+            'last_refreshed_at' => $formatted,
         ]);
     }
 
@@ -154,50 +154,57 @@ class CountryController extends Controller
         $path = public_path('storage/summary.png');
 
         if (!file_exists($path)) {
-            return response()->json(['error' => 'Summary image not found'], 404);
+            return response()->json([
+                'error' => 'Summary image not found',
+                'hint'  => 'Run POST /countries/refresh first to generate the image',
+            ], 404);
         }
 
         return response()->file($path);
     }
 
-
-    // ✅ Image Generation
     private function generateSummaryImage()
     {
         $top5 = Country::orderByDesc('estimated_gdp')->take(5)->get();
-        $timestamp = now()->format('Y-m-d H:i:s');
+        $timestamp = now()->format('Y-m-d H:i:s T');
 
         $manager = new ImageManager(new Driver());
         $img = $manager->create(800, 600)->fill('#1a1a1a');
 
-        $img->text('Country GDP Summary', 400, 50, fn($font) =>
-            $font->size(36)->color('#ffffff')->align('center')
-        );
+        $img->text('Country GDP Summary', 400, 50, function ($font) {
+            $font->size(36)->color('#ffffff')->align('center')->valign('top');
+        });
 
-        $img->text("Total Countries: " . Country::count(), 400, 120, fn($font) =>
-            $font->size(28)->color('#4ade80')->align('center')
-        );
+        $img->text("Total Countries: " . Country::count(), 400, 120, function ($font) {
+            $font->size(28)->color('#4ade80')->align('center');
+        });
 
-        $img->text('Top 5 by Estimated GDP', 400, 180, fn($font) =>
-            $font->size(24)->color('#60a5fa')->align('center')
-        );
+        $img->text('Top 5 by Estimated GDP', 400, 180, function ($font) {
+            $font->size(24)->color('#60a5fa')->align('center');
+        });
 
         foreach ($top5 as $index => $country) {
             $gdp = $country->estimated_gdp
                 ? number_format($country->estimated_gdp / 1_000_000_000, 2) . 'B'
                 : 'N/A';
+            $name = Str::limit($country->name, 20);
+            $text = sprintf('%d. %s — $%s', $index + 1, $name, $gdp);
 
-            $img->text(($index+1).". {$country->name} — $".$gdp, 400, 230 + ($index * 40), fn($font) =>
-                $font->size(20)->color('#e5e7eb')->align('center')
-            );
+            $img->text($text, 400, 230 + ($index * 40), function ($font) {
+                $font->size(20)->color('#e5e7eb')->align('center');
+            });
         }
 
-        $img->text("Generated: {$timestamp}", 400, 550, fn($font) =>
-            $font->size(18)->color('#9ca3af')->align('center')
-        );
+        $img->text("Generated: {$timestamp}", 400, 550, function ($font) {
+            $font->size(18)->color('#9ca3af')->align('center');
+        });
 
         $path = public_path('storage/summary.png');
-        if (!is_dir(dirname($path))) mkdir(dirname($path), 0755, true);
+        $dir = dirname($path);
+        if (!is_dir($dir)) {
+            mkdir($dir, 0755, true);
+        }
+
         $img->save($path);
     }
 }
